@@ -6,6 +6,7 @@ const projects = [
     name: 'Premium Roofing Co.',
     location: 'Amsterdam & Omgeving',
     image: '/images/portimage1.jpg',
+    caseStudyUrl: 'https://rood-install-now.base44.app',
     challenge: 'Verouderde website, amper offerte-aanvragen via internet',
     results: [
       { icon: TrendingUp, stat: '+68%', label: 'Meer offerte-aanvragen' },
@@ -20,6 +21,7 @@ const projects = [
     name: 'Apex Roofing Solutions',
     location: 'Rotterdam & Den Haag',
     image: '/images/portimage2.jpg',
+    caseStudyUrl: 'https://app.base44.com/apps/6a0cbadf8ee5744e2f9719f5/editor/preview',
     challenge: 'Geen mobiele optimalisatie, hoge bounce-rate',
     results: [
       { icon: TrendingUp, stat: '+52%', label: 'Meer aanvragen' },
@@ -34,6 +36,7 @@ const projects = [
     name: 'North Holland Roof Works',
     location: 'Noord-Holland',
     image: '/images/portimage3.jpg',
+    caseStudyUrl: 'https://smitten-home-flow.base44.app',
     challenge: 'Onzichtbaar in lokale Google-resultaten',
     results: [
       { icon: TrendingUp, stat: '+89%', label: 'Organisch verkeer' },
@@ -129,19 +132,33 @@ export default function PortfolioSection() {
                     })}
                   </div>
 
-                  <button className="btn-secondary text-sm w-fit">
+                  <a
+                    href={project.caseStudyUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="btn-secondary text-sm w-fit"
+                    aria-label={`Bekijk case study: ${project.name}`}
+                  >
                     Bekijk case study
                     <ArrowUpRight className="w-4 h-4" />
-                  </button>
+                  </a>
                 </div>
 
                 {/* Right: Image */}
                 <div className="relative h-64 lg:h-auto overflow-hidden">
-                  <img
-                    src={project.image}
-                    alt={project.name}
-                    className="w-full h-full object-cover transition-transform duration-700 ease-in-out group-hover:scale-[1.06]"
-                  />
+                  <a
+                    href={project.caseStudyUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="block w-full h-full"
+                    aria-label={`Open case study: ${project.name}`}
+                  >
+                    <img
+                      src={project.image}
+                      alt={project.name}
+                      className="w-full h-full object-cover transition-transform duration-700 ease-in-out group-hover:scale-[1.06]"
+                    />
+                  </a>
                   <div className="absolute inset-0 bg-gradient-to-r from-white/20 to-transparent lg:from-transparent" />
                 </div>
               </div>
