@@ -21,7 +21,7 @@ const projects = [
     name: 'Apex Roofing Solutions',
     location: 'Rotterdam & Den Haag',
     image: '/images/portimage2.jpg',
-    caseStudyUrl: 'https://app.base44.com/apps/6a0cbadf8ee5744e2f9719f5/editor/preview',
+    caseStudyUrl: 'https://big-prime-paint-pros.base44.app',
     challenge: 'Geen mobiele optimalisatie, hoge bounce-rate',
     results: [
       { icon: TrendingUp, stat: '+52%', label: 'Meer aanvragen' },
