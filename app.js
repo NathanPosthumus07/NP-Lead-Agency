@@ -30,8 +30,9 @@
     user: null, profile: null,
     tab: "dashboard",
     clients: [], tasks: [], messages: [], notes: [], events: [], profiles: [],
+    conversations: [], members: [], activeChat: null,
     clientFilter: "All", taskFilter: "All",
-    chatDraft: "", modal: null,
+    chatDraft: "", modal: null, sidebarOpen: false,
     authMode: "signin", authError: "", authNotice: "", authBusy: false
   };
 
@@ -49,9 +50,17 @@
     return cs[h % cs.length];
   }
   function initial(name) { return name ? name.trim()[0].toUpperCase() : "?"; }
-  function avatar(name, size) {
+  function profileFor(name) { if (!name) return null; return state.profiles.find(p => p.name && p.name.toLowerCase() === String(name).toLowerCase()) || null; }
+  function initialsAvatar(name, size) {
     const c = personColor(name);
     return `<div class="avatar" style="width:${size}px;height:${size}px;background:${hx(c, 0.13)};color:${c};font-size:${Math.round(size * 0.4)}px">${esc(initial(name))}</div>`;
+  }
+  function avatar(name, size) {
+    const p = profileFor(name);
+    if (p && p.avatar_url) {
+      return `<div class="avatar" style="width:${size}px;height:${size}px"><img src="${esc(p.avatar_url)}" alt="${esc(name || "")}" style="width:100%;height:100%;object-fit:cover"></div>`;
+    }
+    return initialsAvatar(name, size);
   }
   function chip(status) {
     const c = STATUS_COLOR[status] || "#6b7280";
@@ -155,9 +164,11 @@
      DATA
      ============================================================ */
   async function loadAll() {
-    await Promise.all([reload("clients"), reload("tasks"), reload("messages"), reload("notes"), reload("events"), reloadProfiles()]);
+    await Promise.all([reload("clients"), reload("tasks"), reload("messages"), reload("notes"), reload("events"), reloadProfiles(), reloadConvos(), reloadMembers()]);
   }
   async function reloadProfiles() { const { data } = await sb.from("profiles").select("*"); state.profiles = data || []; }
+  async function reloadConvos() { const { data } = await sb.from("conversations").select("*").order("created_at", { ascending: false }); state.conversations = data || []; }
+  async function reloadMembers() { const { data } = await sb.from("conversation_members").select("*"); state.members = data || []; }
   async function reload(table) {
     const order = { clients: ["created_at", false], tasks: ["created_at", false], messages: ["created_at", true], notes: ["updated_at", false], events: ["date", true] }[table];
     let q = sb.from(table).select("*");
@@ -170,9 +181,12 @@
   function subscribe() {
     if (channel) return;
     channel = sb.channel("np-db");
-    ["clients", "tasks", "messages", "notes", "events", "profiles"].forEach(t => {
+    ["clients", "tasks", "messages", "notes", "events", "profiles", "conversations", "conversation_members"].forEach(t => {
       channel.on("postgres_changes", { event: "*", schema: "public", table: t }, async () => {
-        if (t === "profiles") await reloadProfiles(); else await reload(t);
+        if (t === "profiles") await reloadProfiles();
+        else if (t === "conversations") await reloadConvos();
+        else if (t === "conversation_members") await reloadMembers();
+        else await reload(t);
         render();
       });
     });
@@ -186,7 +200,7 @@
   const addClient = (c) => sb.from("clients").insert(c).then(after);
   const setClientStatus = (id, status) => sb.from("clients").update({ status }).eq("id", id).then(after);
   const delClient = (id) => sb.from("clients").delete().eq("id", id).then(after);
-  const sendMsg = (text) => sb.from("messages").insert({ text, sender_id: state.user.id, sender_name: myName() }).then(after);
+  const sendMsg = (text, convId) => sb.from("messages").insert({ text, sender_id: state.user.id, sender_name: myName(), conversation_id: convId || null }).then(after);
   const addNote = (n) => sb.from("notes").insert(n).then(after);
   const delNote = (id) => sb.from("notes").delete().eq("id", id).then(after);
   const togglePin = (id, pinned) => sb.from("notes").update({ pinned: !pinned }).eq("id", id).then(after);
@@ -194,6 +208,59 @@
   const delEvent = (id) => sb.from("events").delete().eq("id", id).then(after);
   // optimistic refresh fallback (realtime will also fire)
   async function after() { await loadAll(); render(); }
+
+  /* ---------- conversations / chat helpers ---------- */
+  function myId() { return state.user && state.user.id; }
+  function profileById(id) { return state.profiles.find(p => p.id === id) || null; }
+  function memberIds(convId) { return state.members.filter(m => m.conversation_id === convId).map(m => m.user_id); }
+  function amMember(convId) { return memberIds(convId).indexOf(myId()) !== -1; }
+  function findDM(peerId) {
+    return state.conversations.find(c => {
+      if (c.kind !== "dm") return false;
+      const ids = memberIds(c.id);
+      return ids.length === 2 && ids.indexOf(myId()) !== -1 && ids.indexOf(peerId) !== -1;
+    }) || null;
+  }
+  function buildChatList() {
+    const list = [{ key: "team", kind: "team", title: "Team", sub: "Shared channel \u00b7 everyone" }];
+    state.profiles.filter(p => p.id !== myId()).forEach(p => {
+      const dm = findDM(p.id);
+      list.push({ key: dm ? dm.id : "dm:" + p.id, kind: "dm", title: p.name || p.email || "Member", sub: "Direct message", convId: dm ? dm.id : "", peerId: p.id, name: p.name || p.email || "Member" });
+    });
+    state.conversations.filter(c => c.kind === "group" && amMember(c.id)).forEach(c => {
+      const names = memberIds(c.id).map(id => { const pr = profileById(id); return pr ? (pr.name || "Member") : null; }).filter(Boolean);
+      list.push({ key: c.id, kind: "group", title: c.name || "Group", sub: names.join(", ") || "Group", convId: c.id, name: c.name || "Group" });
+    });
+    return list;
+  }
+  function activeMessages() {
+    const a = state.activeChat;
+    if (!a || a.kind === "team") return state.messages.filter(m => !m.conversation_id);
+    return state.messages.filter(m => m.conversation_id === a.convId);
+  }
+  async function createDM(peerId, name) {
+    const { data, error } = await sb.from("conversations").insert({ kind: "dm", created_by: myId() }).select().single();
+    if (error || !data) { alert("Couldn't start chat: " + (error ? error.message : "")); return; }
+    await sb.from("conversation_members").insert([{ conversation_id: data.id, user_id: myId() }, { conversation_id: data.id, user_id: peerId }]);
+    await loadAll();
+    state.activeChat = { key: data.id, kind: "dm", convId: data.id, peerId: peerId, name: name };
+    render();
+  }
+  async function createGroup(name, ids) {
+    const { data, error } = await sb.from("conversations").insert({ kind: "group", name: name, created_by: myId() }).select().single();
+    if (error || !data) { alert("Couldn't create group: " + (error ? error.message : "")); return; }
+    const rows = [{ conversation_id: data.id, user_id: myId() }];
+    ids.filter(i => i !== myId()).forEach(i => rows.push({ conversation_id: data.id, user_id: i }));
+    await sb.from("conversation_members").insert(rows);
+    await loadAll();
+    state.activeChat = { key: data.id, kind: "group", convId: data.id, name: name };
+    closeModal(); render();
+  }
+  function openConv(ds) {
+    if (ds.kind === "dm" && !ds.conv) { createDM(ds.peer, ds.name); return; }
+    state.activeChat = { key: ds.key, kind: ds.kind, convId: ds.conv || null, peerId: ds.peer || null, name: ds.name };
+    state.chatDraft = ""; render();
+  }
 
   /* ============================================================
      RENDER
@@ -272,8 +339,9 @@
     const dueToday = state.tasks.filter(t => !t.done && t.due === todayISO()).length;
     const unread = ""; // not tracked
     return `
+    ${state.sidebarOpen ? `<div class="sidebar-overlay" data-action="close-sidebar"></div>` : ""}
     <div class="shell">
-      <aside class="sidebar">
+      <aside class="sidebar ${state.sidebarOpen ? "open" : ""}">
         <div class="brand-row">
           <div class="logo-tile">${LOGO}</div>
           <span class="wordmark">NpStudio</span>
@@ -283,21 +351,23 @@
           ${NAV.map(n => {
             let badge = "";
             if (n.key === "tasks" && dueToday) badge = `<span class="badge">${dueToday}</span>`;
-            return `<div class="nav-item ${state.tab === n.key ? "active" : ""}" data-action="nav" data-tab="${n.key}"><span class="num">${n.num}</span><span class="label">${n.label}</span>${badge}</div>`;
+            return `<div class="nav-item ${state.tab === n.key ? "active" : ""}" data-action="nav-item" data-tab="${n.key}"><span class="num">${n.num}</span><span class="label">${n.label}</span>${badge}</div>`;
           }).join("")}
         </nav>
         <div class="user">
-          ${avatar(myName(), 34)}
-          <div style="flex:1;min-width:0">
-            <div class="name">${esc(myName())}</div>
-            <div class="role">${esc((state.user.email || "").toUpperCase())}</div>
+          <div data-action="edit-profile" title="Edit profile" style="display:flex;align-items:center;gap:10px;flex:1;min-width:0;cursor:pointer;border-radius:9px;padding:4px;margin:-4px" class="user-click">
+            ${avatar(myName(), 34)}
+            <div style="flex:1;min-width:0">
+              <div class="name">${esc(myName())}</div>
+              <div class="role">${esc((state.user.email || "").toUpperCase())}</div>
+            </div>
           </div>
           <div class="out" data-action="signout" title="Sign out">⏻</div>
         </div>
       </aside>
       <main class="main">
         <header class="topbar">
-          <div class="title"><span class="pnum">${meta.num}</span><h2>${meta.label}</h2></div>
+          <div class="title"><button class="hamburger" data-action="toggle-sidebar" aria-label="Menu"><span></span><span></span><span></span></button><span class="pnum">${meta.num}</span><h2>${meta.label}</h2></div>
           <div class="right">
             <div class="date">${new Date().toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric" }).toUpperCase()}</div>
             <div class="avatars">${everyone().slice(0, 2).map(n => avatar(n, 30)).join("")}</div>
@@ -416,10 +486,43 @@
 
   /* ---------- CHAT ---------- */
   function renderChat() {
-    const msgs = state.messages;
+    const list = buildChatList();
+    if (!state.activeChat) state.activeChat = { key: "team", kind: "team", convId: null, name: "Team" };
+    const active = state.activeChat;
+
+    // unread/last-message preview per conversation
+    function lastMsgFor(item) {
+      let pool;
+      if (item.kind === "team") pool = state.messages.filter(m => !m.conversation_id);
+      else if (item.convId) pool = state.messages.filter(m => m.conversation_id === item.convId);
+      else pool = [];
+      return pool.length ? pool[pool.length - 1] : null;
+    }
+
+    const listHTML = list.map(item => {
+      const sel = item.key === active.key;
+      const last = lastMsgFor(item);
+      const preview = last ? esc((last.sender_id === myId() ? "You: " : "") + last.text).slice(0, 38) : esc(item.sub);
+      let ic;
+      if (item.kind === "team") ic = `<div class="avatar" style="width:38px;height:38px;background:${hx("#6d4aff", 0.13)};color:#6d4aff;font-size:15px">◎</div>`;
+      else if (item.kind === "group") ic = `<div class="avatar" style="width:38px;height:38px;background:${hx("#9333ea", 0.13)};color:#9333ea;font-size:14px">${esc((item.name || "G").slice(0, 2).toUpperCase())}</div>`;
+      else ic = avatar(item.name, 38);
+      const dataConv = item.convId || "";
+      return `<div class="conv ${sel ? "active" : ""}" data-action="open-conv" data-kind="${item.kind}" data-key="${esc(item.key)}" data-conv="${esc(dataConv)}" data-peer="${esc(item.peerId || "")}" data-name="${esc(item.name || item.title)}">
+        ${ic}
+        <div style="flex:1;min-width:0">
+          <div class="conv-title">${esc(item.title)}</div>
+          <div class="conv-sub">${preview}</div>
+        </div>
+      </div>`;
+    }).join("");
+
+    // active conversation messages
+    const msgs = activeMessages();
     let body;
     if (!msgs.length) {
-      body = `<div class="chat-empty">No messages yet.<br>Say hi to ${esc(partner())} 👋</div>`;
+      const hint = active.kind === "team" ? "This channel is shared with everyone." : active.kind === "group" ? "Group chat — say something to get it going." : "Say hi to " + esc(active.name) + " 👋";
+      body = `<div class="chat-empty">No messages yet.<br>${hint}</div>`;
     } else {
       let lastDay = "";
       body = msgs.map(m => {
@@ -427,21 +530,38 @@
         const day = new Date(m.created_at).toDateString();
         let pill = "";
         if (day !== lastDay) { lastDay = day; pill = `<div class="day-pill">${new Date(m.created_at).toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric" }).toUpperCase()}</div>`; }
-        return pill + `<div class="msg ${me ? "me" : "them"}"><div class="bubble">${esc(m.text)}</div><div class="meta">${esc(m.sender_name || "")} · ${timeOf(m.created_at)}</div></div>`;
+        const showName = !me && (active.kind !== "dm");
+        return pill + `<div class="msg ${me ? "me" : "them"}">${showName ? `<div class="msg-author">${esc(m.sender_name || "")}</div>` : ""}<div class="bubble">${esc(m.text)}</div><div class="meta">${esc(m.sender_name || "")} · ${timeOf(m.created_at)}</div></div>`;
       }).join("");
     }
+
+    // header
+    let headIcon, headTitle, headSub;
+    if (active.kind === "team") { headIcon = `<div class="avatar" style="width:38px;height:38px;background:${hx("#6d4aff", 0.13)};color:#6d4aff;font-size:15px">◎</div>`; headTitle = "Team"; headSub = "Shared channel · everyone"; }
+    else if (active.kind === "group") { const names = memberIds(active.convId).map(id => { const p = profileById(id); return p ? p.name : null; }).filter(Boolean); headIcon = `<div class="avatar" style="width:38px;height:38px;background:${hx("#9333ea", 0.13)};color:#9333ea;font-size:14px">${esc((active.name || "G").slice(0, 2).toUpperCase())}</div>`; headTitle = active.name || "Group"; headSub = names.join(", "); }
+    else { headIcon = avatar(active.name, 38); headTitle = active.name; headSub = "Direct message"; }
+
     return `
-    <div class="chat">
-      <div class="chat-head">
-        ${avatar(partner(), 38)}
-        <div style="flex:1"><div class="who">${esc(partner())}</div><div class="online"><span class="dot"></span>WORKSPACE CHAT</div></div>
-        <div class="mono" style="font-size:10px;letter-spacing:.1em;color:var(--faint)">${msgs.length} MSGS</div>
+    <div class="chat-wrap">
+      <div class="chat-list scroll">
+        <div class="chat-list-head">
+          <span class="mono" style="font-size:10px;letter-spacing:.16em;color:var(--faint)">CONVERSATIONS</span>
+          <button class="btn btn-sm" data-action="new-group" title="New group" style="padding:5px 9px">+ Group</button>
+        </div>
+        ${listHTML}
       </div>
-      <div class="chat-body scroll">${body}</div>
-      <div class="chat-foot">
-        <div class="chat-input-row">
-          <input class="field" id="chatInput" placeholder="Message ${esc(partner())}…">
-          <button class="send" data-action="send">→</button>
+      <div class="chat">
+        <div class="chat-head">
+          ${headIcon}
+          <div style="flex:1"><div class="who">${esc(headTitle)}</div><div class="online"><span class="dot"></span>${esc((headSub || "").toUpperCase())}</div></div>
+          <div class="mono" style="font-size:10px;letter-spacing:.1em;color:var(--faint)">${msgs.length} MSGS</div>
+        </div>
+        <div class="chat-body scroll">${body}</div>
+        <div class="chat-foot">
+          <div class="chat-input-row">
+            <input class="field" id="chatInput" placeholder="Message ${esc(headTitle)}…">
+            <button class="send" data-action="send">→</button>
+          </div>
         </div>
       </div>
     </div>`;
@@ -589,9 +709,36 @@
         <div class="row2"><div><label class="label">Title</label><input class="field" id="nTitle" placeholder="Note title"></div><div><label class="label">Tag</label><input class="field" id="nTag" placeholder="BRAND"></div></div>
         <div class="row"><label class="label">Body</label><textarea class="field" id="nBody" rows="5" placeholder="Write your note…"></textarea></div>
         <div class="modal-actions"><button class="btn btn-sm" data-action="close-modal">Cancel</button><button class="btn btn-primary btn-sm" data-action="save-note">Add note</button></div></div>`;
+    } else if (state.modal.type === "profile") {
+      const p = state.profile || {};
+      const cur = p.avatar_url ? `<img id="pfPreview" src="${esc(p.avatar_url)}" style="width:72px;height:72px;border-radius:50%;object-fit:cover">` : `<div id="pfPreview" class="avatar" style="width:72px;height:72px;background:${hx(personColor(p.name), 0.13)};color:${personColor(p.name)};font-size:28px">${esc(initial(p.name))}</div>`;
+      wrap.innerHTML = `<div class="modal"><h3>Edit profile</h3>
+        <div style="display:flex;align-items:center;gap:16px;margin-bottom:18px">
+          <div id="pfAvatarWrap">${cur}</div>
+          <div>
+            <label class="btn btn-sm" for="pfFile" style="cursor:pointer">Upload photo</label>
+            <input id="pfFile" type="file" accept="image/*" style="display:none">
+            <div class="mono" id="pfStatus" style="font-size:10px;color:var(--faint);margin-top:6px">JPG or PNG, up to ~3MB</div>
+          </div>
+        </div>
+        <div class="row"><label class="label">Display name</label><input class="field" id="pfName" value="${esc(p.name || "")}" placeholder="Your name"></div>
+        <div class="row"><label class="label">Email</label><input class="field" value="${esc(state.user.email || "")}" disabled style="opacity:.6"></div>
+        <div class="modal-actions"><button class="btn btn-sm" data-action="close-modal">Cancel</button><button class="btn btn-primary btn-sm" data-action="save-profile">Save profile</button></div></div>`;
+    } else if (state.modal.type === "group") {
+      const others = state.profiles.filter(p => p.id !== myId());
+      wrap.innerHTML = `<div class="modal"><h3>New group</h3>
+        <div class="row"><label class="label">Group name</label><input class="field" id="grName" placeholder="e.g. Mara Project"></div>
+        <div class="row"><label class="label">Members</label>
+          <div style="display:flex;flex-direction:column;gap:8px;margin-top:6px">
+            ${others.length ? others.map(p => `<label style="display:flex;align-items:center;gap:10px;cursor:pointer;font-size:14px"><input type="checkbox" class="grMember" value="${esc(p.id)}" style="width:16px;height:16px;accent-color:#6d4aff">${avatar(p.name, 26)}${esc(p.name || p.email)}</label>`).join("") : `<div class="section-sub">No other members have signed in yet. Once your cofounder logs in, they'll appear here.</div>`}
+          </div>
+        </div>
+        <div class="modal-actions"><button class="btn btn-sm" data-action="close-modal">Cancel</button><button class="btn btn-primary btn-sm" data-action="save-group">Create group</button></div></div>`;
     }
     document.body.appendChild(wrap);
-    wrap.addEventListener("click", e => { if (e.target === wrap) closeModal(); });
+    wrap.addEventListener("click", e => { if (e.target === wrap) { closeModal(); return; } onClick(e); });
+    const ff = document.getElementById("pfFile");
+    if (ff) ff.onchange = onPickAvatar;
   }
   function closeModal() { state.modal = null; const b = document.getElementById("modalBg"); if (b) b.remove(); }
 
@@ -612,6 +759,9 @@
     const a = el.dataset.action, id = el.dataset.id;
     switch (a) {
       case "nav": state.tab = el.dataset.tab; state.modal = null; render(); break;
+      case "nav-item": state.tab = el.dataset.tab; state.modal = null; state.sidebarOpen = false; render(); break;
+      case "toggle-sidebar": state.sidebarOpen = !state.sidebarOpen; render(); break;
+      case "close-sidebar": state.sidebarOpen = false; render(); break;
       case "signout": signOut(); break;
       case "toggle-task": if (!e.target.closest('[data-action="del-task"]')) toggleTask(id, el.dataset.done === "true"); break;
       case "del-task": e.stopPropagation(); delTask(id); break;
@@ -625,6 +775,11 @@
       case "new-note": state.modal = { type: "note" }; render(); break;
       case "save-note": doSaveNote(); break;
       case "del-note": delNote(id); break;
+      case "edit-profile": state.modal = { type: "profile" }; render(); break;
+      case "save-profile": doSaveProfile(); break;
+      case "new-group": state.modal = { type: "group" }; render(); break;
+      case "save-group": doSaveGroup(); break;
+      case "open-conv": openConv({ key: el.dataset.key, kind: el.dataset.kind, conv: el.dataset.conv, peer: el.dataset.peer, name: el.dataset.name }); break;
       case "toggle-pin": togglePin(id, el.dataset.pinned === "true"); break;
       case "add-event": doAddEvent(); break;
       case "del-event": e.stopPropagation(); delEvent(id); break;
@@ -645,7 +800,46 @@
   }
   function doSend() {
     const i = document.getElementById("chatInput"); const t = (i ? i.value : "").trim();
-    if (!t) return; state.chatDraft = ""; if (i) i.value = ""; sendMsg(t);
+    if (!t) return; state.chatDraft = ""; if (i) i.value = "";
+    const a = state.activeChat;
+    sendMsg(t, (a && a.kind !== "team") ? a.convId : null);
+  }
+
+  /* ---------- profile + avatar upload ---------- */
+  let pendingAvatar = null;
+  function onPickAvatar(e) {
+    const file = e.target.files && e.target.files[0]; if (!file) return;
+    if (file.size > 3.5 * 1024 * 1024) { const s = document.getElementById("pfStatus"); if (s) { s.textContent = "That image is a bit large — pick one under ~3MB."; s.style.color = "#c2185b"; } return; }
+    pendingAvatar = file;
+    const reader = new FileReader();
+    reader.onload = ev => { const w = document.getElementById("pfAvatarWrap"); if (w) w.innerHTML = `<img src="${ev.target.result}" style="width:72px;height:72px;border-radius:50%;object-fit:cover">`; };
+    reader.readAsDataURL(file);
+  }
+  async function doSaveProfile() {
+    const name = ((document.getElementById("pfName") || {}).value || "").trim() || myName();
+    const statusEl = document.getElementById("pfStatus");
+    let avatar_url = state.profile ? state.profile.avatar_url : null;
+    if (pendingAvatar) {
+      if (statusEl) { statusEl.textContent = "Uploading…"; statusEl.style.color = "var(--faint)"; }
+      const ext = (pendingAvatar.name.split(".").pop() || "png").toLowerCase();
+      const path = state.user.id + "/avatar_" + Date.now() + "." + ext;
+      const up = await sb.storage.from("avatars").upload(path, pendingAvatar, { upsert: true, cacheControl: "3600" });
+      if (up.error) { if (statusEl) { statusEl.textContent = "Upload failed: " + up.error.message; statusEl.style.color = "#c2185b"; } return; }
+      const { data: pub } = sb.storage.from("avatars").getPublicUrl(path);
+      avatar_url = pub.publicUrl;
+    }
+    await sb.from("profiles").update({ name, avatar_url, color: personColor(name) }).eq("id", state.user.id);
+    pendingAvatar = null;
+    await reloadProfiles();
+    state.profile = state.profiles.find(p => p.id === state.user.id) || state.profile;
+    closeModal(); render();
+  }
+  function doSaveGroup() {
+    const name = ((document.getElementById("grName") || {}).value || "").trim();
+    if (!name) { const el = document.getElementById("grName"); if (el) el.focus(); return; }
+    const ids = [...document.querySelectorAll(".grMember:checked")].map(c => c.value);
+    if (!ids.length) { alert("Pick at least one member for the group."); return; }
+    createGroup(name, ids);
   }
   function doSaveClient() {
     const name = (document.getElementById("mName") || {}).value || "";

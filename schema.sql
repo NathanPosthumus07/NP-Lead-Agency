@@ -97,3 +97,57 @@ alter publication supabase_realtime add table public.tasks;
 alter publication supabase_realtime add table public.messages;
 alter publication supabase_realtime add table public.notes;
 alter publication supabase_realtime add table public.events;
+
+-- ============================================================
+--  MIGRATION — profile pictures, groups & direct messages
+--  (safe to run on an existing database; only adds things)
+-- ============================================================
+
+-- profile picture
+alter table public.profiles add column if not exists avatar_url text;
+
+-- conversations: 'team' is implicit (messages with null conversation_id);
+-- 'dm' = 1:1, 'group' = named multi-person
+create table if not exists public.conversations (
+  id         uuid primary key default gen_random_uuid(),
+  kind       text not null default 'group',   -- 'dm' | 'group'
+  name       text,
+  created_by uuid,
+  created_at timestamptz default now()
+);
+
+create table if not exists public.conversation_members (
+  conversation_id uuid references public.conversations(id) on delete cascade,
+  user_id         uuid references auth.users(id) on delete cascade,
+  created_at      timestamptz default now(),
+  primary key (conversation_id, user_id)
+);
+
+-- route messages to a conversation (null = shared Team channel)
+alter table public.messages add column if not exists conversation_id uuid references public.conversations(id) on delete cascade;
+
+alter table public.conversations        enable row level security;
+alter table public.conversation_members enable row level security;
+
+-- any signed-in user can read/create conversations & membership
+drop policy if exists "conversations all" on public.conversations;
+drop policy if exists "members all"       on public.conversation_members;
+create policy "conversations all" on public.conversations        for all to authenticated using (true) with check (true);
+create policy "members all"       on public.conversation_members for all to authenticated using (true) with check (true);
+
+alter publication supabase_realtime add table public.conversations;
+alter publication supabase_realtime add table public.conversation_members;
+
+-- ============================================================
+--  STORAGE — avatars bucket (public read, signed-in write)
+-- ============================================================
+insert into storage.buckets (id, name, public)
+values ('avatars', 'avatars', true)
+on conflict (id) do nothing;
+
+drop policy if exists "avatars public read"  on storage.objects;
+drop policy if exists "avatars auth write"   on storage.objects;
+drop policy if exists "avatars auth update"  on storage.objects;
+create policy "avatars public read" on storage.objects for select using (bucket_id = 'avatars');
+create policy "avatars auth write"  on storage.objects for insert to authenticated with check (bucket_id = 'avatars');
+create policy "avatars auth update" on storage.objects for update to authenticated using (bucket_id = 'avatars');
